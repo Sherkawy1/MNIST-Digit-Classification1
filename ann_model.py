@@ -1,102 +1,154 @@
-#!/usr/bin/env python
-import cv2 as cv
-import numpy as np
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, random_split # divide the dataset
+import torch.nn as nn
+import torch.optim as optim
 
+transform = transforms.ToTensor()
 
-CAMERA_MATRIX = np.array([
-    [983.91572635,   0.0, 480.52646536],   # fx, 0, cx
-    [  0.0, 984.66144487, 651.75676875],   # 0, fy, cy
-    [  0.0,   0.0,   1.0]
-])
-DIST_COEFS = np.array([0.1, -0.2, 0.0, 0.0, 0.0])
+full_dataset = torchvision.datasets.MNIST(
+    root='./data',
+    train=True,
+    download=True,
+    transform=transform
+)
 
-FX = CAMERA_MATRIX[0, 0]
-FY = CAMERA_MATRIX[1, 1]
+print(f"Original dataset size: {len(full_dataset)}")
 
-CAMERA_HEIGHT_CM = 20.0
+train_size = int(0.80 * len(full_dataset))
+validation_size = int(0.10 * len(full_dataset))
+test_size = len(full_dataset) - train_size - validation_size
 
-MIN_CONTOUR_AREA = 800
-CANNY_LOW = 50
-CANNY_HIGH = 150
+train_dataset, validation_dataset, test_dataset = random_split(
+    full_dataset,
+    [train_size, validation_size, test_size],
+    generator=torch.Generator().manual_seed(42) # to make the split random
+)
 
+print(f"Train dataset size: {len(train_dataset)}")
+print(f"Validation dataset size: {len(validation_dataset)}")
+print(f"Test dataset size: {len(test_dataset)}")
 
-def undistort_frame(frame, new_camera_matrix):
-    return cv.undistort(frame, CAMERA_MATRIX, DIST_COEFS, None, new_camera_matrix)
+train_loader = DataLoader(
+    dataset=train_dataset,
+    batch_size=64,
+    shuffle=True
+)
 
+validation_loader = DataLoader(
+    dataset=validation_dataset,
+    batch_size=64,
+    shuffle=False
+)
 
-def detect_objects(frame):
-    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-    blurred = cv.GaussianBlur(gray, (5, 5), 0)
-    edged = cv.Canny(blurred, CANNY_LOW, CANNY_HIGH)
-    edged = cv.dilate(edged, None, iterations=2)
-    edged = cv.erode(edged, None, iterations=1)
+test_loader = DataLoader(
+    dataset=test_dataset,
+    batch_size=64,
+    shuffle=False
+)
 
-    contours, _ = cv.findContours(edged, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    valid_contours = [c for c in contours if cv.contourArea(c) > MIN_CONTOUR_AREA]
-    return valid_contours
+class NeuralNet(nn.Module):
+    def __init__(self):
+        super(NeuralNet, self).__init__()
 
+        self.fc1 = nn.Linear(28 * 28, 128)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(128, 10)
 
-def pixels_to_cm(pixel_length, focal_px):
-    return (pixel_length * CAMERA_HEIGHT_CM) / focal_px
+    def forward(self, x):
+        x = x.view(-1, 28 * 28)
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
+model = NeuralNet()
 
-def main():
-    cap = cv.VideoCapture(1)
-    ret, frame = cap.read()
-    if not ret:
-        print("ERORR!!")
-        return
+criterion = nn.CrossEntropyLoss() # to calculate the error bet. prediction and label
+optimizer = optim.Adam(model.parameters(), lr=0.001) #to update the gradients
 
-    h, w = frame.shape[:2]
-    new_camera_matrix, roi = cv.getOptimalNewCameraMatrix(
-        CAMERA_MATRIX, DIST_COEFS, (w, h), 1, (w, h)
+epochs = 4
+
+print("\nStarting training...")
+
+for epoch in range(epochs):
+
+    model.train()
+
+    running_loss = 0.0
+
+    for images, labels in train_loader:
+
+        optimizer.zero_grad()
+
+        outputs = model(images)
+
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    train_loss = running_loss / len(train_loader)
+
+    model.eval()
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+
+        for images, labels in validation_loader:
+
+            outputs = model(images) #making prediction
+
+            _, predicted = torch.max(outputs.data, 1) #choose the highest prediction
+
+            total += labels.size(0)
+
+            correct += (predicted == labels).sum().item() #to compare how many of them is correct
+
+    validation_accuracy = 100 * correct / total
+
+    print(
+        f"Epoch [{epoch + 1}/{epochs}], "
+        f"Train Loss: {train_loss:.4f}, "
+        f"Validation Accuracy: {validation_accuracy:.2f}%"
     )
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+print("\nTraining finished successfully!")
 
-        frame = undistort_frame(frame, new_camera_matrix)
-        contours = detect_objects(frame)
+model.eval()
 
-        for c in contours:
-            rect = cv.minAreaRect(c)
-            (cx, cy), (pw, ph), angle = rect
+correct = 0
+total = 0
 
-            width_px, height_px = max(pw, ph), min(pw, ph)
-            real_width_cm = pixels_to_cm(width_px, FX)
-            real_height_cm = pixels_to_cm(height_px, FY)
+with torch.no_grad():
 
-            box = cv.boxPoints(rect)
-            box = np.intp(box)
-            cv.drawContours(frame, [box], -1, (0, 255, 0), 2)
+    for images, labels in test_loader:
 
-            (tl, tr, br, bl) = box
+        outputs = model(images)
 
-            top_mid_x = int((tl[0] + tr[0]) / 2)
-            top_mid_y = int((tl[1] + tr[1]) / 2)
+        _, predicted = torch.max(outputs.data, 1)
 
-            left_mid_x = int((tl[0] + bl[0]) / 2)
-            left_mid_y = int((tl[1] + bl[1]) / 2)
+        total += labels.size(0)
 
-            FONT_SCALE = 0.8
-            THICKNESS = 2
-            TEXT_COLOR = (0,0,255)
+        correct += (predicted == labels).sum().item()
 
-            cv.putText(frame, f"{real_width_cm:.1f} cm", (top_mid_x - 40, top_mid_y - 15),
-                       cv.FONT_HERSHEY_SIMPLEX, FONT_SCALE, TEXT_COLOR, THICKNESS)
+test_accuracy = 100 * correct / total
 
-            cv.putText(frame, f"{real_height_cm:.1f} cm", (left_mid_x - 70, left_mid_y),
-                       cv.FONT_HERSHEY_SIMPLEX, FONT_SCALE, TEXT_COLOR, THICKNESS)
+print(f"\nTest Accuracy: {test_accuracy:.2f}%")
 
-        cv.imshow("Object Dimensions (Live)", frame)
-        if cv.waitKey(1) & 0xFF == ord('x'):
-            break
+with torch.no_grad():
 
-    cap.release()
-    cv.destroyAllWindows()
+    sample_image, sample_label = test_dataset[0]
 
+    output = model(sample_image.unsqueeze(0))
 
-if __name__ == '__main__':
-    main()
+    predicted_digit = torch.argmax(output, dim=1).item()
+
+print("\n--- Sample Prediction ---")
+print(f"True Label: {sample_label}")
+print(f"Predicted Digit: {predicted_digit}")
